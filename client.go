@@ -1,102 +1,82 @@
-// IDEA: ConcurrentBus.AddSound gives dsp.Sound a channel it can write to
-// once the sound has terminated it sends EOF to channel and Bus discards channel
-// subtype of sound FilteredSound accepts filter
+// IDEA: subtype of sound FilteredSound accepts filter
 // FilterChain is a subtype of Filter
 // Filter implements interface Sound which has method Sample which returns float
-// boolean for "eof/done"-flag
-// a ConcurrentBusSampler created in ConcurrentBus.AddSound could then call
-// Sample() on its Sound object until the channel is full
-// Filters always have a reference to their input Sound object, call their
-// Sample() functions and potentially buffer samples
-package gojade
+// "done" channel
+package jade
 
 // TODO: go through all classes and check if we always need methods on pointers
 // because direct values are cheaper
-// TODO: ensure jack returns nil if we got a nil client (i.e. server not running)
+// TODO: interrupt attack / decay, when envelope is released before sustain
+// TODO: replace ALL maps by slices (performance! maps suck)
+// TODO: improve xrun handling: LPF; increase latency & use point average
+// TODO: check for NULL return values in JACK functions
 
 import (
 	"github.com/esqilin/godsp"
 	"github.com/esqilin/godsp/bus"
-	"github.com/esqilin/godsp/sound"
-	"github.com/esqilin/gojack"
+	"github.com/xthexder/go-jack"
 
 	"fmt"
 	"os"
 )
 
 type Client struct {
-	jack   *gojack.Client
+	Jack   *jack.Client
 	master *bus.ConcurrentBus
-	buf    *sound.BufferedSound
-	aIns   map[string]*gojack.AudioInPort
-	aOuts  map[string]*gojack.AudioOutPort
-	mIns   map[string]*gojack.MidiInPort
-}
-
-//~ type MidiCallback func(byte, byte) // export it
-type MidiEvent gojack.MidiEvent
-
-func (e MidiEvent) IsOn() bool {
-	return gojack.MIDI_NOTE_ON == e.Status
-}
-
-func (e MidiEvent) IsOff() bool {
-	return gojack.MIDI_NOTE_OFF == e.Status
+	portsIn   []audioInPort
+	portsOut  []audioOutPort
+	midisIn   []midiInPort
 }
 
 // New returns a client with JACK client name (if unassigned)
 //
 // if startJack is true and JACK is not running, the server will be started
 func New(name string, startJack bool) (c *Client, err error) {
-	var jc *gojack.Client
-	jc, err = gojack.NewClient(name)
+    jackOptions := jack.NoStartServer
+    if startJack {
+        jackOptions = jack.NullOption
+    }
+
+	jc, status := jack.ClientOpen(name, jackOptions)
 	defer func() {
-		if nil != err && nil != jc {
+		if nil != jc && nil != err {
 			jc.Close()
 		}
 	}()
+    if nil == jc {
+        if 0 != status {
+            err = jack.Strerror(status)
+        } else {
+            err = fmt.Errorf("unknown error opening JACK client")
+        }
+        return nil, err
+    }
 
-	if nil != err {
-		return nil, err
-	}
-
-	if !startJack {
-		jc.SetOptionNoStartServer()
-	}
-
-	if nil != jc.Open() {
-		return nil, err
-	}
-
-	if jc.IsNameNotUnique() {
-		logError(
-			"jack client name not unique; using `%s'",
-			jc.Name(),
-		)
-	}
-
-	dsp.Init(jc.SampleRate())
+	dsp.Init(jc.GetSampleRate())
 
 	master := bus.NewConcurrent()
-
 	c = &Client{
-		jack:   jc,
+		Jack:   jc,
 		master: master,
-		buf:    sound.NewBufferedSound(master, int(2*jc.BufferSize())),
-		aIns:   make(map[string]*gojack.AudioInPort),
-		aOuts:  make(map[string]*gojack.AudioOutPort),
-		mIns:   make(map[string]*gojack.MidiInPort),
 	}
 
-	//~ jc.OnProcess(c.process, nil)
-	//~ jc.OnShutdown(c.shutdown, nil)
-	err = c.jack.Activate()
+    status = jc.SetProcessCallback(c.process)
+    if 0 != status {
+        err = jack.Strerror(status)
+        return c, fmt.Errorf("error setting JACK process callback: %s", err)
+    }
+
+	status = c.Jack.Activate()
+    if 0 != status {
+        err = jack.Strerror(status)
+        err = fmt.Errorf("error activating JACK client: %s", err)
+    }
 
 	return c, err
 }
 
-func (c *Client) Close() {
-	c.jack.Close()
+func (c Client) Close() {
+	c.Jack.Close()
 }
 
 // PlaySound important: sounds must not use any common Sampleable objects
@@ -106,155 +86,101 @@ func (c Client) PlaySound(s dsp.Sound) error {
 	return nil
 }
 
-func (c Client) Play(target chan<- float32) {
-	go func(target chan<- float32) {
-		for {
-			target <- float32(c.master.Sample())
-		}
-	}(target)
+func (c Client) Play(ch chan<- float64) {
+    go func (s dsp.Sound, ch chan<- float64) {
+        for { // TODO: add "done" channel
+            ch <- s.Sample()
+        }
+    }(c.master, ch)
 }
 
-// AddAudioIn isTerminal determines whether signal will be passed on or not
-// (processed or not)
-func (c *Client) AddAudioIn(name string, isTerminal bool) (<-chan float32, error) {
-	_, exists := c.aIns[name]
-	if exists {
-		return nil, fmt.Errorf("port name `%s' already assigned")
-	}
-	p, err := c.jack.RegisterAudioIn(name, isTerminal)
-	c.aIns[name] = p
-	return p.Channel(), err
+
+func (c *Client) AddAudioOut(name string, bufferRatio float32) chan<- float64 {
+    p := c.Jack.PortRegister(name, jack.DEFAULT_AUDIO_TYPE, jack.PortIsOutput, 0)
+    n := int(float32(c.Jack.GetBufferSize()) * (1.0 + bufferRatio))
+    ch := make(chan float64, n)
+    c.portsOut = append(c.portsOut, audioOutPort{ p, ch })
+    return ch
 }
 
-// AddAudioOut isSynthesized determines whether signal is generated from scratch
-// or processed from a given input signal
-func (c *Client) AddAudioOut(name string, isSynthesized bool) (chan<- float32, error) {
-	_, exists := c.aOuts[name]
-	if exists {
-		return nil, fmt.Errorf("port name `%s' already assigned")
-	}
-	p, err := c.jack.RegisterAudioOut(name, isSynthesized)
-	c.aOuts[name] = p
-	return p.Channel(), err
+func (c *Client) AddAudioIn(name string) <-chan float64  {
+	p := c.Jack.PortRegister(name, jack.DEFAULT_AUDIO_TYPE, jack.PortIsInput, 0)
+    ch := make(chan float64, c.Jack.GetBufferSize())
+    c.portsIn = append(c.portsIn, audioInPort{ p, ch })
+    return ch
 }
 
-func (c *Client) AddMidiIn(name string) (<-chan MidiEvent, error) {
-	_, exists := c.mIns[name]
-	if exists {
-		return nil, fmt.Errorf("port name `%s' already assigned", name)
-	}
-	p, err := c.jack.RegisterMidiIn(name, true)
-	c.mIns[name] = p
-
-	chOut := make(chan MidiEvent, c.jack.BufferSize())
-	go func(in <-chan gojack.MidiEvent, out chan<- MidiEvent) {
-		for {
-			s, more := <-in
-			if !more {
-				return
-			}
-			out <- MidiEvent(s)
-		}
-	}(p.Channel(), chOut)
-
-	return chOut, err
+func (c *Client) AddMidiIn(name string) chan jack.MidiData {
+    p := c.Jack.PortRegister(name, jack.DEFAULT_MIDI_TYPE, jack.PortIsInput, 0)
+    ch := make(chan jack.MidiData, c.Jack.GetBufferSize())
+    c.midisIn = append(c.midisIn, midiInPort{ p, ch })
+    return ch
 }
 
-//~ func (c *Client) addMidiCallback(midiInName string, mc gojack.MidiCallback) error {
-//~ p, exists := c.mIns[midiInName]
-//~ if !exists {
-//~ return fmt.Errorf("no such midi input port: `%s'", midiInName)
-//~ }
-//~ mc_ := gojack.MidiCallback(mc)
-//~ p.AddCallback(&mc_)
-//~ return nil
-//~ }
-
-//~ func onMidiOnCallback(mc MidiCallback) gojack.MidiCallback {
-//~ return func(status byte, i byte, v byte) {
-//~ if gojack.MIDI_NOTE_ON == status {
-//~ mc(i, v)
-//~ }
-//~ }
-//~ }
-
-//~ func (c *Client) AddMidiOnCallback(midiInName string, mc MidiCallback) error {
-//~ return c.addMidiCallback(midiInName, onMidiOnCallback(mc))
-//~ }
-//~
-//~ func onMidiOffCallback(mc MidiCallback) gojack.MidiCallback {
-//~ return func(status byte, i byte, v byte) {
-//~ if gojack.MIDI_NOTE_OFF == status {
-//~ mc(i, v)
-//~ }
-//~ }
-//~ }
-
-//~ func (c *Client) AddMidiOffCallback(midiInName string, mc MidiCallback) error {
-//~ return c.addMidiCallback(midiInName, onMidiOffCallback(mc))
-//~ }
-
-func getNPorts(ports []*gojack.Port, err error) int {
-	if nil != err {
-		logError(err.Error())
-		return 0
-	}
-	return len(ports)
-}
-
-func (c *Client) NSystemSpeakers() int {
-	return getNPorts(c.jack.SystemInputPorts(true))
-}
-
-func (c *Client) NSystemAudioSources() int {
-	return getNPorts(c.jack.SystemOutputPorts(true))
-}
-
-func (c *Client) ConnectSystemSpeaker(name string, systemSpeakerId int) error {
-	ports, err := c.jack.SystemInputPorts(true)
-	if nil != err {
-		return err
-	}
-	p, ok := c.aOuts[name]
-	if !ok {
-		return fmt.Errorf("no such output port `%s'", name)
-	}
-	return c.jack.Connect(&p.Port, ports[systemSpeakerId])
-}
-
-func (c *Client) ConnectSystemAudioSource(name string, systemSourceId int) error {
-	ports, err := c.jack.SystemOutputPorts(true)
-	if nil != err {
-		return err
-	}
-	p, ok := c.aIns[name]
-	if !ok {
-		return fmt.Errorf("no such input port `%s'", name)
-	}
-	return c.jack.Connect(ports[systemSourceId], &p.Port)
+func (c Client) Connect(src, dst string) error {
+    status := c.Jack.Connect(src, dst)
+    if 0 != status {
+        return fmt.Errorf("JACK: %s", jack.Strerror(status))
+    }
+    return nil
 }
 
 func logError(msg string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, msg+"\n", a...)
 }
 
-//~ func (Client) shutdown(interface{}) {
-//~ // empty
-//~ }
+func (c *Client) process(nFrames uint32) int {
+    hasXrun := false
 
-//~ func (c Client) process(in [][]float32, out_ *[][]float32, _ interface{}) error {
-//~ out := *out_
-//~
-//~ nFrames := len(out[0])
-//~ for _, m := range c.mIns {
-//~ m.ProcessEvents(nFrames)
-//~ }
-//~
-//~ // TODO: ALL THIS WILL BREAK WHEN WE HAVE MORE THAN ONE OUTPUT CHANNEL
-//~ for i, buf := range in { // loop input channels
-//~ for j, _ := range buf { // loop buffer
-//~ out[i][j] = float32(0.2 * c.buf.Sample())
-//~ }
-//~ }
-//~ return nil
-//~ }
+    // write inputs to channels
+    for _, p := range c.portsIn {
+        ss := p.jackPort.GetBuffer(nFrames)
+        for _, s := range ss {
+            select {
+            case p.ch <- float64(s):
+            default:
+                hasXrun = true
+            }
+        }
+    }
+    if hasXrun {
+        logError("XRUN: input channel full")
+    }
+
+    hasXrun = false
+    // write MIDI events to channel
+    for _, p := range c.midisIn {
+        es := p.jackPort.GetMidiEvents(nFrames)
+        for _, e := range es {
+            select {
+            case p.ch <- *e:
+            default:
+                hasXrun = true
+            }
+        }
+    }
+    if hasXrun {
+        logError("XRUN: MIDI channel full")
+    }
+
+    hasXrun = false
+    var s0 jack.AudioSample // for sample and hold (make clipping lower)
+    // read channel data into output port
+    for _, p := range c.portsOut {
+        ss := p.jackPort.GetBuffer(nFrames)
+        for i, _ := range ss {
+            select {
+            case s := <-p.ch:
+                s0 = jack.AudioSample(s)
+            default:
+                hasXrun = true
+            }
+            ss[i] = s0
+        }
+    }
+    if hasXrun {
+        logError("XRUN: output channel empty")
+    }
+
+    return 0
+}
